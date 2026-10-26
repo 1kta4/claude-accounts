@@ -1,0 +1,5 @@
+{
+  "name": "claude-accounts",
+  "owner": { "name": "ta41k" },
+  "plugins": [{ "name": "account-badge", "source": "./account-badge" }]
+}

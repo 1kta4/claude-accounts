@@ -1,0 +1,7 @@
+{
+  "name": "account-badge",
+  "version": "0.1.0",
+  "description": "Shows which Claude account a session runs on, and lists the others with /account.",
+  "author": { "name": "ta41k" },
+  "license": "MIT"
+}
