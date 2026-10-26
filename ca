@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# ca - run Claude Code on one of several accounts (Linux and macOS).
+#
+# Every account is its own config folder (CLAUDE_CONFIG_DIR), so each keeps
+# its own login. Skills, plugins, agents, commands, memory and settings are
+# shared with your main ~/.claude folder.
+#
+#   ca                       list accounts
+#   ca add <name>            add an account and log in once
+#   ca <name> [claude args]  start claude on that account (ca work -c)
+#   ca main [claude args]    start claude on your main account
+#   ca shortcut <name> [--folder <path>]
+#                            make an app-menu shortcut (Linux) or a .command (macOS)
+#   ca relink <name>         repair the shared links of an account
+#   ca remove <name> [--yes] delete an account (asks first)
+
+set -euo pipefail
+
+# CA_HOME stands in for your home folder (handy for trying ca out safely).
+HOME_DIR="${CA_HOME:-$HOME}"
+MAIN_DIR="$HOME_DIR/.claude"
+ACCOUNTS_DIR="$HOME_DIR/.claude-accounts"
+RESERVED=" add list ls remove rm relink shortcut help main "
+
+# Folders every account reads straight from ~/.claude (symbolic links).
+SHARED_DIRS="skills plugins agents commands output-styles hooks projects plans todos file-history"
+
+# Files Claude Code replaces whole when it saves them, which would cut a link,
+# so these are copied instead: the newer copy wins, before and after each run.
+SHARED_FILES="settings.json settings.local.json CLAUDE.md keybindings.json"
+
+die() { printf 'ca: %s\n' "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*"; }
+
+account_dir() { printf '%s/%s' "$ACCOUNTS_DIR" "$1"; }
+
+check_name() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "Give the account a name, for example: ca add work"
+  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] ||
+    die "'$name' is not a usable name: letters, digits, - and _ only, up to 32 characters."
+  local lower
+  lower="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+  case "$RESERVED" in *" $lower "*) die "'$name' is a ca command; pick another name." ;; esac
+}
+
+check_account() {
+  check_name "$1"
+  [ -d "$(account_dir "$1")" ] || die "No account '$1'. Add it with: ca add $1"
+}
+
+email_of() {
+  local file="$1"
+  [ -f "$file" ] || return 0
+  # Collapsed to one line, then the email inside the oauthAccount object.
+  tr -d '\n' <"$file" |
+    sed -n 's/.*"oauthAccount"[[:space:]]*:[[:space:]]*{[^{}]*"emailAddress"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+sync_files() {
+  local dir="$1" name main mine
+  for name in $SHARED_FILES; do
+    main="$MAIN_DIR/$name"
+    mine="$dir/$name"
+    if [ -f "$main" ] && { [ ! -f "$mine" ] || [ "$main" -nt "$mine" ]; }; then
+      cp -p "$main" "$mine"
+    elif [ -f "$mine" ] && { [ ! -f "$main" ] || [ "$mine" -nt "$main" ]; }; then
+      cp -p "$mine" "$main"
+    fi
+  done
+}
+
+link_dirs() {
+  local dir="$1" name main mine
+  for name in $SHARED_DIRS; do
+    main="$MAIN_DIR/$name"
+    mine="$dir/$name"
+    [ -L "$mine" ] && continue
+
+    if [ -d "$mine" ]; then
+      if [ -z "$(ls -A "$mine")" ]; then
+        rmdir "$mine"
+      elif [ ! -e "$main" ]; then
+        # The account made it first: move it into main so every account shares it.
+        mv "$mine" "$main"
+      else
+        printf 'ca: %s has files of its own and is not shared. Move what you want to keep into %s, delete it, then run: ca relink\n' "$mine" "$main" >&2
+        continue
+      fi
+    fi
+
+    mkdir -p "$main"
+    ln -s "$main" "$mine"
+  done
+}
+
+connect() {
+  mkdir -p "$MAIN_DIR"
+  link_dirs "$1"
+  sync_files "$1"
+}
+
+run_claude() {
+  local name="$1"
+  shift
+  if [ "$name" = main ]; then
+    env -u CLAUDE_CONFIG_DIR claude "$@"
+    return
+  fi
+
+  check_account "$name"
+  local dir status=0
+  dir="$(account_dir "$name")"
+  connect "$dir"
+  CLAUDE_CONFIG_DIR="$dir" claude "$@" || status=$?
+  sync_files "$dir"
+  return "$status"
+}
+
+list_accounts() {
+  local folder email
+  printf '%-16s %-32s %s\n' ACCOUNT EMAIL FOLDER
+  email="$(email_of "$HOME_DIR/.claude.json")"
+  printf '%-16s %-32s %s\n' main "${email:-(not logged in)}" "$MAIN_DIR"
+  if [ -d "$ACCOUNTS_DIR" ]; then
+    for folder in "$ACCOUNTS_DIR"/*/; do
+      [ -d "$folder" ] || continue
+      folder="${folder%/}"
+      email="$(email_of "$folder/.claude.json")"
+      printf '%-16s %-32s %s\n' "$(basename "$folder")" "${email:-(not logged in)}" "$folder"
+    done
+  fi
+  info ''
+  info 'Start one with: ca <account>    Add one with: ca add <name>'
+}
+
+script_path() {
+  local source="${BASH_SOURCE[0]}"
+  case "$source" in /*) ;; *) source="$PWD/$source" ;; esac
+  printf '%s' "$source"
+}
+
+make_shortcut() {
+  local name="$1" folder="${2:-$HOME_DIR}"
+  [ "$name" = main ] || check_account "$name"
+  [ -d "$folder" ] || die "No folder $folder"
+  local script
+  script="$(script_path)"
+
+  if [ "$(uname -s)" = Darwin ]; then
+    local apps="$HOME_DIR/Applications/Claude accounts"
+    local file="$apps/Claude ($name).command"
+    mkdir -p "$apps"
+    printf '#!/bin/bash\ncd %q && exec %q %q\n' "$folder" "$script" "$name" >"$file"
+    chmod +x "$file"
+    info "Shortcut: $file (double-click it, or drag it to the Dock)"
+  else
+    local apps="${XDG_DATA_HOME:-$HOME_DIR/.local/share}/applications"
+    local file="$apps/claude-account-$name.desktop"
+    mkdir -p "$apps"
+    cat >"$file" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Claude ($name)
+Comment=Claude Code on the $name account
+Exec="$script" $name
+Path=$folder
+Terminal=true
+Categories=Development;
+EOF
+    chmod +x "$file"
+    info "Shortcut: $file (shows up as \"Claude ($name)\" in your app menu)"
+  fi
+}
+
+remove_shortcuts() {
+  local name="$1"
+  rm -f "$HOME_DIR/Applications/Claude accounts/Claude ($name).command" \
+    "${XDG_DATA_HOME:-$HOME_DIR/.local/share}/applications/claude-account-$name.desktop"
+}
+
+add_account() {
+  local name="${1:-}"
+  check_name "$name"
+  shift || true
+  local dir
+  dir="$(account_dir "$name")"
+  [ ! -e "$dir" ] || die "Account '$name' already exists. Start it with: ca $name"
+
+  mkdir -p "$dir"
+  connect "$dir"
+  make_shortcut "$name" ""
+  info "Added '$name'. Log in with the account you want for it; this is the only time you need to."
+
+  case " $* " in *" --no-login "*) ;; *) run_claude "$name" auth login ;; esac
+}
+
+remove_account() {
+  local name="${1:-}"
+  check_account "$name"
+  shift || true
+  local dir
+  dir="$(account_dir "$name")"
+
+  case " $* " in
+    *" --yes "*) ;;
+    *)
+      local answer
+      read -r -p "Delete account '$name' and its login? Shared skills, memory and settings stay. Type the name to confirm: " answer
+      [ "$answer" = "$name" ] || { info 'Nothing deleted.'; return 0; }
+      ;;
+  esac
+
+  # Drop the links first; rm -rf never follows a link, but this keeps it plain.
+  find "$dir" -maxdepth 1 -type l -exec rm -f {} +
+  rm -rf "$dir"
+  remove_shortcuts "$name"
+  info "Removed '$name'."
+}
+
+option() {
+  local flag="$1"
+  shift
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "$flag" ] && [ $# -gt 1 ]; then
+      printf '%s' "$2"
+      return
+    fi
+    shift
+  done
+}
+
+main() {
+  local command="${1:-list}"
+  [ $# -gt 0 ] && shift
+
+  case "$command" in
+    list | ls) list_accounts ;;
+    add) add_account "$@" ;;
+    remove | rm) remove_account "$@" ;;
+    relink)
+      check_account "${1:-}"
+      connect "$(account_dir "$1")"
+      info 'Links repaired.'
+      ;;
+    shortcut) make_shortcut "${1:-}" "$(option --folder "$@")" ;;
+    help | -h | --help) sed -n '2,15p' "$(script_path)" | sed 's/^# \{0,1\}//' ;;
+    *) run_claude "$command" "$@" ;;
+  esac
+}
+
+main "$@"
