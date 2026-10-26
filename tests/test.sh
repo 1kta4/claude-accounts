@@ -29,7 +29,7 @@ ok() { echo "ok - $*"; }
 acct="$CA_HOME/.claude-accounts/work"
 [ -L "$acct/skills" ] || fail "skills is not a link"
 [ -f "$acct/skills/demo/SKILL.md" ] || fail "shared skill not visible"
-[ -f "$acct/settings.json" ] && [ ! -L "$acct/settings.json" ] || fail "settings.json not copied"
+if [ ! -f "$acct/settings.json" ] || [ -L "$acct/settings.json" ]; then fail "settings.json not copied"; fi
 ok "add links folders and copies settings"
 
 if [ "$(uname -s)" = Darwin ]; then
